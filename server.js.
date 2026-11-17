@@ -1,0 +1,197 @@
+
+const express = require("express");
+const cors = require("cors");
+const QRCode = require("qrcode");
+const pino = require("pino");
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+let sock = null;
+let qrCode = null;
+let pairingCode = null;
+let status = "disconnected";
+
+async function startWhatsApp(phoneNumber = null) {
+  const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason
+  } = await import("@whiskeysockets/baileys");
+
+  const { state, saveCreds } =
+    await useMultiFileAuthState("./auth_info");
+
+  sock = makeWASocket({
+    auth: state,
+    logger: pino({ level: "silent" }),
+    printQRInTerminal: false,
+    browser: ["NUSA BOT WA", "Chrome", "1.0.0"]
+  });
+
+  sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("connection.update", async (update) => {
+    const { connection, qr, lastDisconnect } = update;
+
+    if (qr) {
+      qrCode = await QRCode.toDataURL(qr);
+      status = "waiting_qr";
+    }
+
+    if (connection === "open") {
+      status = "connected";
+      qrCode = null;
+      pairingCode = null;
+      console.log("WhatsApp connected!");
+    }
+
+    if (connection === "close") {
+      status = "disconnected";
+      const code =
+        lastDisconnect?.error?.output?.statusCode;
+
+      if (code !== DisconnectReason.loggedOut) {
+        setTimeout(() => startWhatsApp(), 5000);
+      }
+    }
+  });
+
+  sock.ev.on("messages.upsert", async ({ messages }) => {
+    for (const message of messages) {
+      if (!message.message || message.key.fromMe) continue;
+
+      const jid = message.key.remoteJid;
+      if (!jid || jid.endsWith("@g.us")) continue;
+
+      const text =
+        message.message.conversation ||
+        message.message.extendedTextMessage?.text ||
+        "";
+
+      const command = text.trim().toLowerCase();
+
+      if (command === ".menu") {
+        await sock.sendMessage(jid, {
+          text:
+            "NUSA BOT WA\n\n" +
+            ".menu - Lihat menu\n" +
+            ".teka teki - Main teka-teki\n" +
+            ".teka teki bahasa - Teka-teki bahasa"
+        });
+      }
+
+      if (command === ".teka teki") {
+        await sock.sendMessage(jid, {
+          text: "Teka-teki: Apa yang punya kaki tetapi tidak bisa berjalan?\n\nJawab!"
+        });
+      }
+
+      if (command === ".teka teki bahasa") {
+        await sock.sendMessage(jid, {
+          text: "English riddle: What has a head and a tail but no body?\n\nAnswer!"
+        });
+      }
+    }
+  });
+
+  if (phoneNumber && !state.creds.registered) {
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    pairingCode = await sock.requestPairingCode(phoneNumber);
+  }
+}
+
+app.get("/", (req, res) => {
+  res.send("NUSA BOT WA server is running");
+});
+
+app.get("/health", (req, res) => {
+  res.json({ success: true, status });
+});
+
+app.get("/api/whatsapp/status", (req, res) => {
+  res.json({ status });
+});
+
+app.get("/api/whatsapp/qr", (req, res) => {
+  res.json({ qr: qrCode, status });
+});
+
+app.get("/api/whatsapp/pair", async (req, res) => {
+  try {
+    const phone = String(req.query.phone || "").replace(/\D/g, "");
+
+    if (!phone) {
+      return res.status(400).json({
+        error: "Phone number is required"
+      });
+    }
+
+    if (sock) {
+      return res.status(409).json({
+        error: "A WhatsApp connection is already active"
+      });
+    }
+
+    status = "connecting";
+    startWhatsApp(phone).catch(console.error);
+
+    for (let i = 0; i < 30 && !pairingCode; i++) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+
+    if (!pairingCode) {
+      return res.status(504).json({
+        error: "Pairing code not received yet"
+      });
+    }
+
+    res.json({
+      success: true,
+      pairingCode
+    });
+  } catch (error) {
+    status = "error";
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/whatsapp/connect-qr", async (req, res) => {
+  try {
+    if (sock) {
+      return res.status(409).json({
+        error: "Connection already active"
+      });
+    }
+
+    status = "connecting";
+    startWhatsApp().catch(console.error);
+    res.json({ success: true, message: "QR connection started" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/whatsapp/disconnect", async (req, res) => {
+  try {
+    if (sock) {
+      await sock.logout();
+      sock = null;
+    }
+
+    qrCode = null;
+    pairingCode = null;
+    status = "disconnected";
+
+    res.json({ success: true, status });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`NUSA BOT WA running on port ${PORT}`);
+});
